@@ -982,8 +982,6 @@ fn worker(jobs: Vec<Job>, do_move: bool, dest: String, p: Arc<Progress>) {
 fn rclone_upload(dir: &Path, dest: &str, filter: Option<&[String]>, p: &Arc<Progress>) -> io::Result<()> {
     let mut cmd = Command::new("rclone");
     cmd.arg("copy").arg(dir).arg(dest).args([
-        "--exclude",
-        ".removed/**", // never back up culled shots
         "--transfers=4",
         "--checkers=8",
         "--stats=1s",
@@ -991,11 +989,18 @@ fn rclone_upload(dir: &Path, dest: &str, filter: Option<&[String]>, p: &Arc<Prog
         "--stats-log-level",
         "NOTICE",
     ]);
-    // a per-upload list file so concurrent folders don't clash
     let list_path = std::env::temp_dir().join(format!("wpic-upload-{}.txt", std::process::id()));
-    if let Some(names) = filter {
-        fs::write(&list_path, names.join("\n"))?;
-        cmd.arg("--files-from").arg(&list_path);
+    match filter {
+        // --files-from can't be combined with --exclude; the list already can't
+        // reach .removed (it only names files in the occasion root)
+        Some(names) => {
+            fs::write(&list_path, names.join("\n"))?;
+            cmd.arg("--files-from").arg(&list_path);
+        }
+        // whole-folder copy: keep culled shots out of the backup
+        None => {
+            cmd.args(["--exclude", ".removed/**"]);
+        }
     }
     let mut child = cmd
         .stdout(Stdio::null())
