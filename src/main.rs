@@ -33,6 +33,16 @@ struct Config {
     pictures: PathBuf,   // library / sort destination
 }
 
+// What to upload for a given occasion.
+#[derive(Clone, Copy, PartialEq)]
+enum UploadMode {
+    No,
+    All,    // whole folder (photos + movies)
+    Photos, // jpg + nef only
+    Movies, // mov/mp4 only
+    Rated,  // photos rated >= the current min-rating
+}
+
 static CONFIG: OnceLock<Config> = OnceLock::new();
 fn config() -> &'static Config {
     CONFIG.get_or_init(Config::load)
@@ -220,15 +230,6 @@ fn rates_file() -> PathBuf {
 }
 fn restore_file() -> PathBuf {
     std::env::temp_dir().join("wpic-restore.txt")
-}
-
-// What to upload for a given occasion.
-#[derive(Clone, Copy, PartialEq)]
-enum UploadMode {
-    No,
-    All,    // whole folder (photos + movies)
-    Photos, // jpg + nef only (skip movies)
-    Rated,  // photos rated >= the current min-rating
 }
 
 // darktable-compatible XMP sidecar path: "IMG.NEF" -> "IMG.NEF.xmp"
@@ -428,6 +429,13 @@ impl Cluster {
         self.files
             .iter()
             .filter(|f| Self::is_photo(f))
+            .filter_map(|f| f.path.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect()
+    }
+    fn movie_filenames(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .filter(|f| matches!(f.ext.as_str(), "mov" | "mp4"))
             .filter_map(|f| f.path.file_name().map(|n| n.to_string_lossy().to_string()))
             .collect()
     }
@@ -776,6 +784,7 @@ fn start_execute(app: &mut App) {
             UploadMode::No => None,
             UploadMode::All => Some(None),
             UploadMode::Photos => Some(Some(c.photo_filenames())),
+            UploadMode::Movies => Some(Some(c.movie_filenames())),
             UploadMode::Rated => Some(Some(c.rated_filenames(app.min_rating))),
         };
         if app.library {
@@ -937,9 +946,11 @@ fn worker(jobs: Vec<Job>, do_move: bool, dest: String, p: Arc<Progress>) {
     // ---- stage 2: upload marked folders to Drive via rclone ----
     if !to_upload.is_empty() {
         p.set_stage("Uploading to Drive", to_upload.len());
+        let mut up_ok = 0usize;
+        let mut up_err = 0usize;
         for (dir, label, filter) in &to_upload {
             let what = match filter {
-                Some(f) => format!("{} ({} rated files)", label, f.len()),
+                Some(f) => format!("{} ({} files)", label, f.len()),
                 None => label.clone(),
             };
             if let Ok(mut cur) = p.current.lock() {
@@ -948,16 +959,19 @@ fn worker(jobs: Vec<Job>, do_move: bool, dest: String, p: Arc<Progress>) {
             match rclone_upload(dir, &format!("{}/{}", dest, label), filter.as_deref(), &p) {
                 Ok(()) => {
                     p.done.fetch_add(1, Ordering::Relaxed);
+                    up_ok += 1;
                     push_log(&p, format!("uploaded  {}", what));
                 }
                 Err(e) => {
                     p.errors.fetch_add(1, Ordering::Relaxed);
+                    up_err += 1;
                     push_log(&p, format!("UPLOAD ERR {}: {}", label, e));
                 }
             }
             p.frac.store(0, Ordering::Relaxed);
         }
-        push_log(&p, format!("Uploaded {} folder(s) to {}.", to_upload.len(), dest));
+        let tail = if up_err > 0 { format!(", {up_err} FAILED") } else { String::new() };
+        push_log(&p, format!("Uploaded {up_ok} of {} folder(s) to {}{}.", to_upload.len(), dest, tail));
     }
 
     p.finished.store(true, Ordering::Relaxed);
@@ -990,21 +1004,29 @@ fn rclone_upload(dir: &Path, dest: &str, filter: Option<&[String]>, p: &Arc<Prog
         .map_err(|e| io::Error::new(e.kind(), format!("rclone not runnable ({e})")))?;
 
     p.frac.store(0, Ordering::Relaxed);
+    let mut last_error = String::new(); // keep rclone's most recent real error line
     if let Some(err) = child.stderr.take() {
         for line in io::BufReader::new(err).lines().map_while(Result::ok) {
             if let Some(pct) = parse_percent(&line) {
                 p.frac.store((pct * 100.0) as u64, Ordering::Relaxed);
             }
+            let l = line.trim();
+            if l.contains("ERROR") || l.contains("Failed") || l.contains("error") {
+                // strip the leading "timestamp NOTICE/ERROR :" noise if present
+                last_error = l.rsplit(" : ").next().unwrap_or(l).to_string();
+            }
             if let Ok(mut cur) = p.current.lock() {
-                *cur = line.trim().to_string();
+                *cur = l.to_string();
             }
         }
     }
     let status = child.wait()?;
     if status.success() {
         Ok(())
-    } else {
+    } else if last_error.is_empty() {
         Err(io::Error::other(format!("rclone exited with {status}")))
+    } else {
+        Err(io::Error::other(last_error))
     }
 }
 
@@ -1550,6 +1572,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 UploadMode::No => Span::raw(""),
                 UploadMode::All => Span::styled("  ↥ all", Style::new().fg(Color::Cyan)),
                 UploadMode::Photos => Span::styled("  ↥ pics", Style::new().fg(Color::Cyan)),
+                UploadMode::Movies => Span::styled("  ↥ mov", Style::new().fg(Color::Cyan)),
                 UploadMode::Rated => {
                     Span::styled(format!("  ↥ ★{nstar} pics"), Style::new().fg(Color::Cyan))
                 }
@@ -2010,8 +2033,11 @@ fn run(term: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Resu
                         c.up = match c.up {
                             UploadMode::No => UploadMode::All,
                             UploadMode::All => UploadMode::Photos,
+                            UploadMode::Photos if c.movie_count() > 0 => UploadMode::Movies,
                             UploadMode::Photos if c.rated_count(min) > 0 => UploadMode::Rated,
                             UploadMode::Photos => UploadMode::No,
+                            UploadMode::Movies if c.rated_count(min) > 0 => UploadMode::Rated,
+                            UploadMode::Movies => UploadMode::No,
                             UploadMode::Rated => UploadMode::No,
                         };
                     }
