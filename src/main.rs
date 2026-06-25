@@ -1297,6 +1297,9 @@ fn review_cluster(c: &mut Cluster, only_rated: bool, min: u8) -> String {
 
     // one helper (uses $imv_pid/$imv_current_file/$imv_current_index/$imv_file_count)
     let helper = std::env::temp_dir().join("wpic-imv.sh");
+    // The helper only RECORDS to files; the view is advanced by imv's own native
+    // `close`/`next` commands chained in the bind (imv-msg is unreliable here —
+    // it needs a runtime socket — but native commands always work).
     let _ = fs::write(
         &helper,
         format!(
@@ -1304,13 +1307,8 @@ fn review_cluster(c: &mut Cluster, only_rated: bool, min: u8) -> String {
              CULL='{cull}'\n\
              RATES='{rates}'\n\
              case \"$1\" in\n\
-             rate) printf '%s\\t%s\\n' \"$2\" \"$3\" >> \"$RATES\"; imv-msg \"$imv_pid\" next 2>/dev/null ;;\n\
-             cull)\n\
-             \tprintf '%s\\n' \"$2\" >> \"$CULL\"\n\
-             \tidx=\"$3\"; cnt=\"$4\"\n\
-             \timv-msg \"$imv_pid\" close 2>/dev/null\n\
-             \tnew=$((cnt-1)); [ \"$idx\" -gt \"$new\" ] && idx=\"$new\"\n\
-             \t[ \"$idx\" -ge 1 ] && imv-msg \"$imv_pid\" goto \"$idx\" 2>/dev/null ;;\n\
+             rate) printf '%s\\t%s\\n' \"$2\" \"$3\" >> \"$RATES\" ;;\n\
+             cull) printf '%s\\n' \"$2\" >> \"$CULL\" ;;\n\
              undo) last=$(tail -n1 \"$CULL\" 2>/dev/null); [ -n \"$last\" ] && sed -i '$ d' \"$CULL\" && imv-msg \"$imv_pid\" open \"$last\" 2>/dev/null ;;\n\
              esac\n",
             cull = cull.to_string_lossy(),
@@ -1318,15 +1316,14 @@ fn review_cluster(c: &mut Cluster, only_rated: bool, min: u8) -> String {
         ),
     );
 
-    // imv treats each -c as ONE command, so pass one bind per -c flag
+    // imv treats each -c as ONE command; pass one bind per -c flag. After the
+    // exec, `; next` / `; close` are imv's own native commands.
     let h = helper.to_string_lossy();
     let mut bind_cmds: Vec<String> = Vec::new();
     for n in 0..=5 {
-        bind_cmds.push(format!("bind {n} exec sh '{h}' rate {n} \"$imv_current_file\""));
+        bind_cmds.push(format!("bind {n} exec sh '{h}' rate {n} \"$imv_current_file\" ; next"));
     }
-    bind_cmds.push(format!(
-        "bind <Delete> exec sh '{h}' cull \"$imv_current_file\" \"$imv_current_index\" \"$imv_file_count\""
-    ));
+    bind_cmds.push(format!("bind <Delete> exec sh '{h}' cull \"$imv_current_file\" ; close"));
     bind_cmds.push(format!("bind u exec sh '{h}' undo"));
 
     let mut cmd = Command::new("imv");
@@ -1440,18 +1437,13 @@ fn view_removed(c: &mut Cluster) -> String {
     let _ = fs::write(
         &helper,
         format!(
-            "#!/bin/sh\n\
-             RESTORE='{r}'\n\
-             printf '%s\\n' \"$2\" >> \"$RESTORE\"\n\
-             idx=\"$3\"; cnt=\"$4\"\n\
-             imv-msg \"$imv_pid\" close 2>/dev/null\n\
-             new=$((cnt-1)); [ \"$idx\" -gt \"$new\" ] && idx=\"$new\"\n\
-             [ \"$idx\" -ge 1 ] && imv-msg \"$imv_pid\" goto \"$idx\" 2>/dev/null\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{r}'\n",
             r = restore.to_string_lossy()
         ),
     );
+    // record the file, then close it natively (imv's own command)
     let bind = format!(
-        "bind <Return> exec sh '{h}' restore \"$imv_current_file\" \"$imv_current_index\" \"$imv_file_count\"",
+        "bind <Return> exec sh '{h}' \"$imv_current_file\" ; close",
         h = helper.to_string_lossy()
     );
     let view_paths: Vec<PathBuf> = views.iter().map(|(p, _)| p.clone()).collect();
